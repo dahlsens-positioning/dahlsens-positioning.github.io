@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dahlsens Positioning</title>
+<style>
+html, body { margin: 0; height: 100%; background: #fbfaf6; }
+#frame { position: fixed; inset: 0; width: 100%; height: 100%; border: 0; display: block; }
+#status { font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; color: #173f2d; text-align: center; padding: 40vh 24px 0; }
+</style>
+</head>
+<body>
+<!-- Loads the live Dahlsens Positioning page and adds a "Submit assessment" button
+     that sends each completed assessment to a Google Sheet. -->
+<div id="status">Loading the assessment…</div>
+<script>
+// Google Apps Script web app URL (ends in /exec).
+var SHEET_URL = 'https://script.google.com/macros/s/AKfycbyHyNoaHOP6vm34qEYqraBF1kPFRYT7xI2XwUrUrNDFsD-XjbG6ccuBoP3GF7UBAickqg/exec';
+// The original assessment page. It is loaded fresh on each visit, so changes to it show up here too.
+var PAGE_URL = 'https://aebmokka-create.github.io/Business-Solutions/Positioning.html';
+
+(function () {
+  var status = document.getElementById('status');
+  fetch(PAGE_URL, { cache: 'no-cache' })
+    .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
+    .then(function (html) {
+      var frame = document.createElement('iframe');
+      frame.id = 'frame';
+      frame.title = 'Dahlsens Positioning assessment';
+      frame.setAttribute('allow', 'web-share; clipboard-write');
+      frame.addEventListener('load', function () {
+        var w = frame.contentWindow, d = frame.contentDocument;
+        if (!d || !d.body || !d.getElementById('app')) return;
+        if (status.parentNode) status.parentNode.removeChild(status);
+        if (w.__dpSubmit) return;
+        var s = d.createElement('script');
+        s.textContent = '(' + addon.toString() + ')(' + JSON.stringify(SHEET_URL) + ');';
+        d.body.appendChild(s);
+      });
+      frame.srcdoc = html;
+      document.body.appendChild(frame);
+    })
+    .catch(function () {
+      status.textContent = 'Sorry, the assessment could not be loaded. Please check your internet connection and refresh the page.';
+    });
+
+  // Runs inside the Positioning page, so it can read the page's own data and calculations.
+  function addon(SHEET_URL) {
+    if (window.__dpSubmit) return;
+    window.__dpSubmit = true;
+    var DONE_KEY = 'dahlsensPositioningSubmitted';
+    var ID_KEY = 'dahlsensPositioningSubmissionId';
+
+    function hash(s) { var h = 5381; for (var i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0; return String(h); }
+    function who() { return ((data.person.name || '') + '|' + (data.person.location || '')).trim().toLowerCase(); }
+
+    // One ID per person and market on this device, so a resubmission updates their row.
+    function submissionId() {
+      var saved = {};
+      try { saved = JSON.parse(localStorage.getItem(ID_KEY) || '{}'); } catch (e) {}
+      if (saved.id && saved.who === who()) return saved.id;
+      var id = 'DP-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).slice(2, 6).toUpperCase();
+      try { localStorage.setItem(ID_KEY, JSON.stringify({ id: id, who: who() })); } catch (e) {}
+      return id;
+    }
+
+    function build() {
+      var calc = calculations(), n = data.companies.length, totals = [], counts = [];
+      for (var ci = 0; ci < n; ci++) {
+        var t = 0, c = 0;
+        calc.forEach(function (x) { if (typeof x.scores[ci] === 'number') { t += x.scores[ci]; c++; } });
+        totals.push(t); counts.push(c);
+      }
+      var ranked = data.companies.map(function (_, i) { return { name: companyName(i), total: totals[i], count: counts[i], index: i }; })
+        .filter(function (x) { return x.count; })
+        .sort(function (a, b) { return b.total - a.total || a.index - b.index; });
+      var dRank = -1;
+      ranked.forEach(function (x, i) { if (x.index === 0) dRank = i; });
+      var valid = calc.filter(function (x) { return x.gap !== null; });
+      var best = valid.slice().sort(function (a, b) { return b.gap - a.gap; })[0];
+      var worst = valid.slice().sort(function (a, b) { return a.gap - b.gap; })[0];
+      var done = calc.filter(function (x) { return typeof x.scores[0] === 'number'; }).length;
+      var headers = [], row = {};
+      function put(h, v) { headers.push(h); row[h] = v; }
+      put('Name', (data.person.name || '').trim());
+      put('Role', (data.person.role || '').trim());
+      put('Market, branch or area', (data.person.location || '').trim());
+      put('Lifecycle stage', data.lifecycle ? data.lifecycle.stage : 'Not selected');
+      put('Competitors', data.companies.slice(1).map(function (_, i) { return companyName(i + 1); }).join('; '));
+      put('No. of competitors', n - 1);
+      put('Progress %', Math.round(done / criteria.length * 100));
+      put('Dahlsens total', totals[0]);
+      put('Dahlsens rank', dRank >= 0 ? dRank + 1 : '');
+      put('Share of mind (top 3)', ranked.slice(0, 3).map(function (x, i) { return (i + 1) + '. ' + x.name + ' (' + x.total + ')'; }).join('; '));
+      put('Greatest perceived advantage', best ? signed(best.gap) + ' ' + best.q[0] : 'Not yet established');
+      put('Largest perceived gap', worst ? signed(worst.gap) + ' ' + worst.q[0] : 'Not yet established');
+      put('Supporting comment', data.comment || '');
+      for (var k = 0; k < n; k++) {
+        var label = k === 0 ? 'Dahlsens' : 'Competitor ' + k;
+        if (k > 0) put(label, companyName(k));
+        criteria.forEach(function (q, qi) {
+          var v = data.scores[qi] ? data.scores[qi]['c' + k] : undefined;
+          put(label + ' - ' + String(qi + 1).padStart(2, '0') + ' ' + q[0], v === null ? 'DK' : (typeof v === 'number' ? v : ''));
+        });
+      }
+      return { id: submissionId(), headers: headers, row: row };
+    }
+
+    function submit(btn) {
+      if (!/^https:\/\/script\.google(usercontent)?\.com\//.test(SHEET_URL)) {
+        alert('Submissions are not switched on yet. Please contact the person who sent you this link.');
+        return;
+      }
+      try { if (typeof captureSetup === 'function') captureSetup(); } catch (e) {}
+      var p = build();
+      if (!p.row['Progress %'] && !confirm('You have not graded Dahlsens on any consideration yet. Submit anyway?')) return;
+      var sig = hash(JSON.stringify(p));
+      btn.disabled = true;
+      btn.textContent = 'Submitting…';
+      fetch(SHEET_URL, { method: 'POST', body: JSON.stringify(p) })
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+          if (!j || !j.ok) throw new Error((j && j.error) || 'Not saved');
+          try { localStorage.setItem(DONE_KEY, sig); } catch (e) {}
+          paint();
+          alert('Thank you – your assessment has been submitted.');
+        })
+        .catch(function () {
+          btn.disabled = false;
+          btn.textContent = 'Submit assessment';
+          alert('Sorry, your assessment could not be submitted. Please check your internet connection and try again.');
+        });
+    }
+
+    // Adds the button to the results screen and the share-of-mind screen whenever they are shown.
+    function paint() {
+      var bars = document.querySelectorAll('#app .exports, #app .mindActions');
+      if (!bars.length) return;
+      var submitted = false;
+      try { submitted = localStorage.getItem(DONE_KEY) === hash(JSON.stringify(build())); } catch (e) {}
+      bars.forEach(function (bar) {
+        var b = bar.querySelector('.dpSubmit');
+        if (!b) {
+          b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'dpSubmit';
+          b.addEventListener('click', function () { submit(b); });
+          if (bar.classList.contains('exports')) bar.insertBefore(b, bar.firstChild); else bar.appendChild(b);
+        }
+        b.textContent = submitted ? 'Submitted ✓' : 'Submit assessment';
+        b.disabled = submitted;
+        b.style.cssText = 'background:#c79a44;border-color:#c79a44;color:#fff;font-weight:700;' + (submitted ? 'opacity:.75;cursor:default' : 'cursor:pointer');
+      });
+    }
+
+    var app = document.getElementById('app');
+    if (app) new MutationObserver(paint).observe(app, { childList: true });
+    paint();
+  }
+})();
+</script>
+</body>
+</html>
